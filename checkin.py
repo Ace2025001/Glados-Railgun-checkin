@@ -97,15 +97,20 @@ def log_method(func):
 
 
 def parse_cookies(raw: str) -> List[str]:
-    """只提取认证字段，避免统计 Cookie 内的 & 被误当作账号分隔符。"""
+    """保留现有 Cookie 格式；可识别的 koa 会话仅保留认证字段。"""
     sessions = re.findall(r"(?:^|[;\s&])koa:sess=([^;\s&]+)", raw)
     signatures = re.findall(r"(?:^|[;\s&])koa:sess\.sig=([^;\s&]+)", raw)
-    if not sessions or len(sessions) != len(signatures):
-        raise ValueError("GLADOS_COOKIES 必须包含成对的 koa:sess 和 koa:sess.sig；请复制完整 Cookie。")
-    return list(dict.fromkeys(
-        f"koa:sess={session}; koa:sess.sig={signature};"
-        for session, signature in zip(sessions, signatures)
-    ))
+    if sessions and len(sessions) == len(signatures):
+        return list(dict.fromkeys(
+            f"koa:sess={session}; koa:sess.sig={signature};"
+            for session, signature in zip(sessions, signatures)
+        ))
+    # 其他认证 Cookie 格式不强制套用 koa 字段，保持原脚本兼容性。
+    cookies = [cookie.strip() for cookie in raw.split("&") if cookie.strip()]
+    if not cookies:
+        raise ValueError("GLADOS_COOKIES 为空。")
+    logger.info(f"使用兼容 Cookie 格式：{len(cookies)} 段；识别到 {len(sessions)} 个 koa 会话和 {len(signatures)} 个签名。")
+    return cookies
 
 
 class Config:
