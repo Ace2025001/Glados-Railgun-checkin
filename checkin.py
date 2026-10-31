@@ -1,5 +1,4 @@
 import os
-import re
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -97,20 +96,13 @@ def log_method(func):
 
 
 def parse_cookies(raw: str) -> List[str]:
-    """保留现有 Cookie 格式；可识别的 koa 会话仅保留认证字段。"""
-    sessions = re.findall(r"(?:^|[;\s&])koa:sess=([^;\s&]+)", raw)
-    signatures = re.findall(r"(?:^|[;\s&])koa:sess\.sig=([^;\s&]+)", raw)
-    if sessions and len(sessions) == len(signatures):
-        return list(dict.fromkeys(
-            f"koa:sess={session}; koa:sess.sig={signature};"
-            for session, signature in zip(sessions, signatures)
-        ))
-    # 其他认证 Cookie 格式不强制套用 koa 字段，保持原脚本兼容性。
-    cookies = [cookie.strip() for cookie in raw.split("&") if cookie.strip()]
-    if not cookies:
+    """本仓库仅配置一个账号；完整保留 Cookie 值中的 &。"""
+    cookie = raw.strip()
+    if cookie.lower().startswith("cookie:"):
+        cookie = cookie.split(":", 1)[1].strip()
+    if not cookie:
         raise ValueError("GLADOS_COOKIES 为空。")
-    logger.info(f"使用兼容 Cookie 格式：{len(cookies)} 段；识别到 {len(sessions)} 个 koa 会话和 {len(signatures)} 个签名。")
-    return cookies
+    return [cookie]
 
 
 class Config:
