@@ -1,6 +1,5 @@
 import os
 import sys
-import time
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
@@ -95,16 +94,6 @@ def log_method(func):
     return wrapper
 
 
-def parse_cookies(raw: str) -> List[str]:
-    """本仓库仅配置一个账号；完整保留 Cookie 值中的 &。"""
-    cookie = raw.strip()
-    if cookie.lower().startswith("cookie:"):
-        cookie = cookie.split(":", 1)[1].strip()
-    if not cookie:
-        raise ValueError("GLADOS_COOKIES 为空。")
-    return [cookie]
-
-
 class Config:
     """应用配置"""
 
@@ -162,7 +151,7 @@ class Config:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIES}' 未设置。")
             self.cookies_list = []
         else:
-            self.cookies_list = parse_cookies(raw_cookies_env)
+            self.cookies_list = [cookie.strip() for cookie in raw_cookies_env.split("&") if cookie.strip()]
             if not self.cookies_list:
                 raise ValueError(f"环境变量 '{self.ENV_COOKIES}' 已设置，但未包含任何有效的 Cookie。")
 
@@ -181,7 +170,7 @@ class Config:
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}，{self.ENV_SERVERCHAN_KEY} {'已设置' if serverchan_key_env else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
-        if verbose_env:
+        if verbose_env is not None:
             verbose_env_lower = verbose_env.lower()
             if verbose_env_lower in ["true", "1", "yes", "y"]:
                 self.verbose = True
@@ -323,19 +312,6 @@ class API:
             if recover_ua and recover_ua != start_ua:
                 self._log("warning", LogEmoji.WARNING, f"设备平台不匹配 (loginDevice={login_device})，切换 UA 重试", force=True)
                 raw = self._checkin_attempt(url, checkin_data, cookies, recover_ua)
-
-        # 曾出现相同凭据隔日恢复：对无权限响应有限重试，不输出 Cookie。
-        for delay in (10, 20):
-            if raw is None or raw.get("code") != -2:
-                break
-            self._log("warning", LogEmoji.WARNING, f"认证暂未通过，{delay} 秒后重试", force=True)
-            time.sleep(delay)
-            retry_ua = self._device_ua_cache.get("_last") or start_ua
-            raw = self._checkin_attempt(url, checkin_data, cookies, retry_ua)
-            if raw is not None and raw.get("code") == 4 and raw.get("reason") == "device-mismatch":
-                recover_ua = PLATFORM_UA.get(raw.get("loginDevice"))
-                if recover_ua:
-                    raw = self._checkin_attempt(url, checkin_data, cookies, recover_ua)
 
         return self._parse_checkin(raw)
 
@@ -657,7 +633,6 @@ class Checker:
             checkin_result = api.checkin(cookie)
             result.status = checkin_result["status"]
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
-            result.points = str(checkin_result.get("points", "0"))
 
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
             points_str, points_num = api.get_points(cookie)
@@ -740,33 +715,16 @@ def main():
 
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
             payload = checker.format_results()
-            # 一个 Cookie 在任一兼容站点签到成功或已签，即完成该账号。
-            failed_accounts = [
-                index for index in range(1, len(config.cookies_list) + 1)
-                if not any(
-                    result.cookie_index == index
-                    and result.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
-                    for result in checker.results
-                )
-            ]
-            if failed_accounts:
+            # 当前仅一个账号：至少一个候选 Cookie/域名已签，才算完成。
+            if payload["success"] + payload["repeat"] == 0:
                 exit_code = 1
-                logger.error(f"以下 Cookie 在所有站点均未完成签到: {failed_accounts}")
-            else:
-                logger.info("所有账号均已签到成功或今日已签。")
+                logger.error("所有候选 Cookie 均未通过签到验证。")
             logger.info(f"\n{LogEmoji.END} ========== 签到总结 ==========\n{payload['title']}\n{render_payload(payload)}")
 
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
         payload = {"title": "# 脚本执行出错", "rows": [], "note": str(e)}
         exit_code = 1
-
-    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary_path:
-        with open(summary_path, "a", encoding="utf-8") as summary:
-            summary.write(f"## {payload['title']}\n\n")
-            summary.write(render_payload(payload, "  \n") + "\n")
-            summary.write("\n账号验证：" + ("全部完成（签到成功或今日已签）" if exit_code == 0 else "存在未完成账号，请查看日志") + "\n")
 
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
     push_service = PushService(config if "config" in locals() else None)
