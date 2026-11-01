@@ -1,5 +1,8 @@
 import os
 import sys
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
@@ -110,7 +113,7 @@ class Config:
     DEFAULT_VERBOSE = False
 
     """默认域名"""
-    DOMAINS = ["glados.cloud", "railgun.info"]
+    DOMAINS = ["glados.cloud"]
 
     """兑换计划列表"""
     EXCHANGE_PLANS = {
@@ -213,7 +216,7 @@ class API:
             total=3,
             backoff_factor=1.0,
             status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=("GET", "POST"),
+            allowed_methods=("GET",),
             raise_on_status=False,
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
@@ -275,9 +278,9 @@ class API:
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=data, timeout=(60, 120))
+                response = self.session.post(url, headers=session_headers, json=data, timeout=(15, 45))
             elif method.upper() == "GET":
-                response = self.session.get(url, headers=session_headers, timeout=(60, 120))
+                response = self.session.get(url, headers=session_headers, timeout=(15, 45))
             else:
                 self._log("error", LogEmoji.ERROR, f"不支持的 HTTP 方法: {method}", force=True)
                 return None
@@ -623,34 +626,63 @@ class Checker:
 
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
+        today = datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat()
 
-        with API(domain, cookie_idx, verbose=self.config.verbose) as api:
-            self._log(cookie_idx, domain, LogEmoji.STATUS, "查询剩余天数")
-            days_str, status_code = api.get_status(cookie)
-            result.days = days_str
+        def snapshot(api):
+            points_response = api._make_request(api._get_full_url("/api/user/points"), "GET", cookies=cookie)
+            trend_response = api._make_request(api._get_full_url("/api/user/points/trend?days=30"), "GET", cookies=cookie)
+            if points_response is None or trend_response is None:
+                raise ValueError("无法读取积分余额或每日流水，不执行未经验证的签到")
+            points_data, trend_data = points_response.json(), trend_response.json()
+            if points_data.get("code") != 0 or trend_data.get("code") != 0:
+                raise ValueError("积分查询认证失败或服务异常，请刷新 Cookie 后检查")
+            balance = float(points_data["points"])
+            days = trend_data.get("data", {}).get("days")
+            if not isinstance(days, list):
+                raise ValueError("积分趋势格式变化，无法确认签到入账")
+            matches = [d for d in days if str(d.get("date", ""))[:10] == today]
+            if len(matches) != 1:
+                raise ValueError("每日流水未包含今天，无法确认签到日期")
+            earned = float(matches[0].get("checkin", 0))
+            return balance, earned
 
-            self._log(cookie_idx, domain, LogEmoji.CHECKIN, "执行签到")
-            checkin_result = api.checkin(cookie)
-            result.status = checkin_result["status"]
-            result.code = checkin_result.get("code", CheckinStatus.FAILURE)
+        with API(domain, cookie_idx, verbose=False) as api:
+            try:
+                before, earned_before = snapshot(api)
+                logger.info(f"入账核验：日期={today}，签到前余额={before:g}，今日签到入账={earned_before:g}")
+                if earned_before > 0:
+                    result.code = CheckinStatus.REPEAT
+                    result.status = "今日已签（流水已确认）"
+                    result.points_total = f"{before:g} 积分"
+                    result.exchange = "不兑换、不抽奖"
+                    logger.info(f"验收通过：今天已有签到加分 {earned_before:g}，余额 {before:g}")
+                    return result
 
-            self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
-            points_str, points_num = api.get_points(cookie)
-            result.points_total = points_str
-
-            if self.config.exchange_plan in self.config.EXCHANGE_PLANS:
-                required_points = self.config.EXCHANGE_PLANS[self.config.exchange_plan]
-                self._log(
-                    cookie_idx,
-                    domain,
-                    LogEmoji.EXCHANGE,
-                    f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
-                )
-                result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
-            else:
-                result.exchange = "未配置兑换计划，跳过自动兑换"
-                self._log(cookie_idx, domain, LogEmoji.INFO, "未配置兑换计划，跳过自动兑换")
-
+                checkin_result = api.checkin(cookie)
+                result.points = str(checkin_result.get("points", "0"))
+                after, earned_after = before, earned_before
+                for attempt in range(3):
+                    if attempt:
+                        time.sleep(3)
+                    after, earned_after = snapshot(api)
+                    if earned_after > 0 and after > before:
+                        break
+                result.points_total = f"{after:g} 积分"
+                result.exchange = "不兑换、不抽奖"
+                logger.info(f"入账核验：签到后余额={after:g}，余额变化={after-before:g}，今日签到入账={earned_after:g}")
+                if earned_after > 0 and after > before:
+                    result.code = CheckinStatus.SUCCESS
+                    result.status = "签到成功（流水及余额已确认）"
+                    result.points = f"{after-before:g}"
+                    logger.info(f"验收通过：{today} 签到入账 +{earned_after:g}，余额 {before:g} -> {after:g}")
+                else:
+                    result.code = CheckinStatus.FAILURE
+                    result.status = "签到未入账"
+                    logger.error("验收失败：响应文本不能替代入账记录；今天仍无签到加分或余额没有增加")
+            except (ValueError, KeyError, TypeError) as error:
+                result.code = CheckinStatus.FAILURE
+                result.status = "入账核验失败"
+                logger.error(f"入账核验失败：{error}")
         return result
 
     def get_results(self) -> List[Dict[str, str]]:
